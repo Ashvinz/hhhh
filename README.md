@@ -1,3 +1,498 @@
+## Feature Analysis
+
+# image to csv (features)
+
+import os
+import csv
+import numpy as np
+
+# Feature analysis
+from skimage.io import imread
+from skimage.color import rgb2gray
+from skimage.feature import hog
+from skimage.transform import resize
+
+
+IMAGE_DIR = "..\\Output\\training\\Background_removal"
+OUTPUT_DIR = "..\\Output\\training\\feature_analysis.csv"
+IMG_SIZE = (512,512)
+
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
+
+
+with open(OUTPUT_DIR, "w", newline="") as file:
+
+    writer = csv.writer(file)
+    header_written = False
+
+    for main_folder in sorted(os.listdir(IMAGE_DIR)):
+
+        main_path = os.path.join(IMAGE_DIR, main_folder)
+
+        if not os.path.isdir(main_path):
+            continue
+
+        for class_name in sorted(os.listdir(main_path)):
+
+            class_path = os.path.join(main_path, class_name)
+
+            if not os.path.isdir(class_path):
+                continue
+
+            print(f"Processing Class : {class_name}")
+
+            for filename in os.listdir(class_path):
+
+                if not filename.lower().endswith(IMAGE_EXTENSIONS):
+                    continue
+
+                img_path = os.path.join(class_path, filename)
+
+                try:
+                    img = imread(img_path)
+
+                    if len(img.shape) == 3:
+                        img = rgb2gray(img)
+
+                    img = resize(img, IMG_SIZE)
+
+                    # HOG Feature Extraction
+                    features = hog(
+                        img,
+                        orientations=9,
+                        pixels_per_cell=(64, 64),# 8,8
+                        cells_per_block=(2, 2),
+                        visualize=False
+                    )
+
+                    # Write header only once
+                    if not header_written:
+                        headers = [f"feature_{i}" for i in range(len(features))]
+                        headers.append("label")
+                        writer.writerow(headers)
+                        header_written = True
+
+                    writer.writerow(list(features) + [class_name])
+
+                except Exception as e:
+                    print(f"Skipping {img_path}: {e}")
+
+print(f"\nHOG feature extraction completed.")
+print(f"CSV Saved : {OUTPUT_DIR}")
+
+
+
+## Feature Extraction
+
+import os
+import glob
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import keras_hub
+
+
+IMAGE_DIR = "..\\Output\\training\\Background_removal"
+IMAGE_SIZE = (512, 512)
+BATCH_SIZE = 32
+OUTPUT_CSV_DIR = "..\\Output\\training\\csv\\extracted_features_csv"
+os.makedirs(OUTPUT_CSV_DIR, exist_ok=True)
+
+
+print("Initializing DINOv2 backbone...")
+backbone = keras_hub.models.DinoV2Backbone.from_preset("dinov2_vits14_backbone")
+
+
+extensions = ["*.jpg", "*.jpeg", "*.png", "*.bmp"]
+image_paths = []
+for ext in extensions:
+    image_paths.extend(glob.glob(os.path.join(IMAGE_DIR, "**", ext), recursive=True))
+    image_paths.extend(glob.glob(os.path.join(IMAGE_DIR, "**", ext.upper()), recursive=True))
+
+if not image_paths:
+    raise ValueError(f"No valid images found in subfolders of: {IMAGE_DIR}")
+
+
+
+def parse_and_preprocess(file_path):
+    img = tf.io.read_file(file_path)
+    img = tf.image.decode_jpeg(img, channels=3)
+    img = tf.image.resize(img, IMAGE_SIZE)
+    img = keras_hub.src.models.dinov2.dinov2_image_converter(img)
+    return file_path, img
+
+
+path_dataset = tf.data.Dataset.from_tensor_slices(image_paths)
+dataset = (
+    path_dataset
+    .map(parse_and_preprocess, num_parallel_calls=tf.data.AUTOTUNE)
+    .batch(BATCH_SIZE)
+    .prefetch(tf.data.AUTOTUNE)
+)
+
+
+all_features = []
+all_paths = []
+
+print(f"Processing {len(image_paths)} images across subfolders...")
+for paths, images in dataset:
+    outputs = backbone(images)
+    global_embeddings = outputs["pooled_output"].numpy()
+
+    all_features.append(global_embeddings)
+    all_paths.extend([p.decode('utf-8') for p in paths.numpy()])
+
+features_matrix = np.vstack(all_features)
+feature_dim = features_matrix.shape[1]
+
+feature_cols = [f"feat_{i}" for i in range(feature_dim)]
+
+df = pd.DataFrame(features_matrix, columns=feature_cols)
+df['file_path'] = all_paths
+
+
+def get_class_name(path):
+    return os.path.basename(os.path.dirname(path))
+
+
+df['class'] = df['file_path'].apply(get_class_name)
+cols = ['file_path', 'class'] + feature_cols
+df = df[cols]
+print("Splitting features and generating class-wise CSV files...")
+grouped = df.groupby('class')
+
+for class_name, group_df in grouped:
+    csv_filename = os.path.join(OUTPUT_CSV_DIR, f"{class_name}_features.csv")
+    group_df.to_csv(csv_filename, index=False)
+    print(f"Saved {len(group_df)} records to: {csv_filename}")
+
+print("\nAll class-wise CSV extraction completely finished!")
+
+
+## Feature Correlation:
+import pandas as pd
+
+df1 = pd.read_csv("..\\Output\\training\\csv\\feature_analysis.csv")
+df2 = pd.read_csv("..\\Output\\training\\csv\\feature_extraction.csv")
+
+combined_df = pd.concat([df1, df2], axis=1)
+correlation_matrix = combined_df.corr(numeric_only=True)
+print(correlation_matrix)
+
+combined_df.to_csv("feature_correlation.csv", index=False)
+
+
+
+## Classification
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+import json
+import tensorflow as tf
+from tensorflow.keras.preprocessing import image
+
+from sklearn.model_selection import train_test_split
+from tensorflow.keras import layers, models
+
+
+class CNN:
+    def __init__(self, file_paths,id_col, target_col):
+        self.file_paths = file_paths
+        self.id_col = id_col
+        self.target_col = target_col
+        self.model = None
+
+
+    def load_merge_dataset(self):
+        df1 = pd.read_csv(self.file_paths[0])
+        df2 = pd.read_csv(self.file_paths[1])
+        df3 = pd.read_csv(self.file_paths[2])
+        merged_df = df1.merge(df2, on=self.id_col).merge(df3, on=self.id_col)
+
+        X = merged_df.drop(columns=[self.id_col,self.target_col]).values
+        y = merged_df[self.target_col].values
+        return X,y
+
+    def prepare_spit_data(self, testsize =0.2):
+        X,y = self.load_merge_dataset()
+
+        #split the dataset for training and testing
+        X_train, X_test, y_train,y_test = train_test_split(X, y, test_size=testsize, random_state=42)
+
+        # Reshape 1D -> features shapes
+        self.X_train = np.expand_dims(X_train, axis=-1)
+        self.X_test = np.expand_dims(X_test, axis = -1)
+        self.y_train = y_train
+        self.y_test = y_test
+
+        self.num_features = self.X_train.shape[0]
+
+        print(f'Input Feature Shape : ({self.num_features}, 1)')
+
+    def build_model(self, num_classes =1):
+        model = models.Sequetial([
+                layers.Conv1D(
+                    filters=32,
+                    kernel_size=3,
+                    activation="relu",
+                    input_shape=(self.num_features, 1),
+                ),
+                layers.MaxPooling1D(pool_size=2),
+                layers.Conv1D(filters=64, kernel_size=3, activation="relu"),
+                layers.GlobalAveragePooling1D(),
+                layers.Dense(64, activation="relu"),
+                layers.Dropout(0.3),
+                # Setup output node depending on classification task type
+                layers.Dense(
+                    num_classes,
+                    activation="sigmoid" if num_classes == 1 else "softmax",
+                ),
+            ])
+        loss_fn = ("binary_crossentropy" if num_classes == 1 else "sparse_categorical_crossentropy")
+        model.compile(optimizer="adam", loss=loss_fn, metrics=["accuracy"])
+        self.model = model
+        print("CNN Model compiled successfully.")
+
+
+    def train_model(self, epochs = 20, batch_size =32):
+        if self.model is None:
+            raise ValueError("Not import Model")
+
+        history = self.model.fit(
+            self.X_train,
+            self.y_train,
+            epochs=epochs,
+            batch_size=batch_size,
+            validation_data=(self.X_test, self.y_test),
+        )
+        self.model.save("..\\Models\\CNN.h5")
+
+        #class_names = self.X_train.class_names
+
+        #with open("..\\Models\\class_names.json", "w") as f:
+            #json.dump(class_names, f)
+
+
+    def evaluate_model(self):
+        loss, accuracy = self.model.evaluate(self.X_test, self.y_test)
+        print(f"Test Loss: {loss:.4f} | Test Accuracy: {accuracy:.4f}")
+        return loss, accuracy
+
+
+csv_list = ["..\\Output\\training\\csv\\feature_analysis.csv", "..\\Output\\training\\csv\\feature_selection.csv", "..\\Output\\training\\csv\\feature_correlation.csv"]
+pipeline = CNN(file_paths=csv_list, id_col="ID", target_col="Target")
+
+
+pipeline.prepare_data()
+pipeline.build_model(num_classes=1)
+pipeline.train_model(epochs=15, batch_size=64)
+pipeline.evaluate_model()
+
+
+def prediction(self, spath):
+        model = tf.keras.models.load_model("..\\Models\\CNN.h5")
+
+        # Load class names
+        with open("..\\Models\\class_names.json", "r") as f:
+            class_names = json.load(f)
+
+        print("Classes:", class_names)
+
+        img_height = 512
+        img_width = 512
+
+        img_path = "1.jpg"  # path to your image
+
+        img = image.load_img(img_path, target_size=(img_height, img_width))
+        img_array = image.img_to_array(img)
+        img_array = tf.expand_dims(img_array, axis=0)  # add batch dimension
+
+        predictions = model.predict(img_array)
+        predicted_index = np.argmax(predictions[0])
+
+        predicted_class = class_names[predicted_index]
+
+        print(f"Predicted Class : {predicted_class}")
+
+
+
+##GMM
+
+import os
+import cv2
+import numpy as np
+from scipy.stats import multivariate_normal
+from sklearn.cluster import KMeans
+
+
+class GMM:
+    def __init__(self, n_components=2, max_iter=50, tol=1e-3, reg=1e-6):
+        self.k = n_components
+        self.max_iter = max_iter
+        self.tol = tol
+        self.reg = reg
+
+    def _init(self, X):
+        km = KMeans(
+            n_clusters=self.k,
+            n_init=10,
+            random_state=42
+        ).fit(X)
+
+        self.means = km.cluster_centers_
+
+        d = X.shape[1]
+        self.covars = np.array([np.eye(d) for _ in range(self.k)], dtype=float)
+        self.weights = np.ones(self.k) / self.k
+
+    def fit(self, X):
+
+        X = np.asarray(X, dtype=float)
+
+        n, d = X.shape
+
+        self._init(X)
+
+        prev = -1e18
+
+        for _ in range(self.max_iter):
+
+            resp = np.zeros((n, self.k))
+
+            for c in range(self.k):
+
+                cov = self.covars[c] + np.eye(d) * self.reg
+
+                resp[:, c] = self.weights[c] * multivariate_normal.pdf(
+                    X,
+                    mean=self.means[c],
+                    cov=cov,
+                    allow_singular=True
+                )
+
+            s = resp.sum(axis=1, keepdims=True) + 1e-12
+
+            ll = np.sum(np.log(s))
+
+            resp /= s
+
+            Nk = resp.sum(axis=0) + 1e-12
+
+            self.weights = Nk / n
+
+            self.means = (resp.T @ X) / Nk[:, None]
+
+            for c in range(self.k):
+
+                diff = X - self.means[c]
+
+                self.covars[c] = (
+                    (resp[:, c][:, None] * diff).T @ diff
+                ) / Nk[c]
+
+                self.covars[c] += np.eye(d) * self.reg
+
+            if abs(ll - prev) < self.tol:
+                break
+
+            prev = ll
+
+    def predict(self, X):
+
+        X = np.asarray(X, dtype=float)
+
+        n = X.shape[0]
+
+        g = np.zeros((n, self.k))
+
+        for c in range(self.k):
+
+            g[:, c] = self.weights[c] * multivariate_normal.pdf(
+                X,
+                mean=self.means[c],
+                cov=self.covars[c],
+                allow_singular=True
+            )
+
+        return np.argmax(g, axis=1)
+
+
+def process_image(input_path, output_path):
+
+    img = cv2.imread(input_path)
+
+    if img is None:
+        print("Cannot read :", input_path)
+        return
+
+    img = cv2.resize(img, (512, 512))
+
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    pixels = rgb.reshape(-1, 3).astype(float)
+
+    gmm = GMM(n_components=2)
+
+    gmm.fit(pixels)
+
+    labels = gmm.predict(pixels).reshape(img.shape[:2])
+
+    values, counts = np.unique(labels, return_counts=True)
+
+    background = values[np.argmax(counts)]
+
+    mask = np.where(labels == background, 0, 255).astype(np.uint8)
+
+    kernel = np.ones((5, 5), np.uint8)
+
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    foreground = cv2.bitwise_and(img, img, mask=mask)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    cv2.imwrite(output_path, foreground)
+
+    print("Saved :", output_path)
+
+
+##############################################################
+# Main
+##############################################################
+
+def main():
+
+    input_folder = "..\\Output\\training\\data_balancing\\Useful_Insects"
+
+    output_folder = "..\\Output\\training\\Background_removal\\Useful_Insects"
+
+    extensions = (".jpg", ".jpeg", ".png", ".bmp", ".tif")
+
+    for root, dirs, files in os.walk(input_folder):
+
+        for file in files:
+
+            if file.lower().endswith(extensions):
+
+                input_path = os.path.join(root, file)
+
+                relative = os.path.relpath(root, input_folder)
+
+                save_folder = os.path.join(output_folder, relative)
+
+                os.makedirs(save_folder, exist_ok=True)
+
+                output_path = os.path.join(save_folder, file)
+
+                process_image(input_path, output_path)
+
+
+if __name__ == "__main__":
+    main()
+    
+#Main GUI
 import os
 import cv2
 import numpy as np
@@ -215,7 +710,7 @@ class MainGUI:
 
         self.btn_Dataset_splitting = ctk.CTkButton(master=self.label_training, text="Dataset Splitting",
                                                    width=125, height=18, corner_radius=16, fg_color="#88BDA4",
-                                                   text_color="white", command="")#self.Dataset_Splitting
+                                                   text_color="white", command=self.data_spliting)#self.Dataset_Splitting
         self.btn_Dataset_splitting.place(relx=0.5, rely=0.22, anchor="center")
         self.btn_training = ctk.CTkButton(master=self.label_training, text="Training", width=125, height=18,
                                           corner_radius=16, fg_color="#88BDA4", text_color="white",
@@ -590,22 +1085,50 @@ class MainGUI:
 
     def data_spliting(self):
         self.bool_data_spliting = True
+        self.result_window.configure(state="normal")
+
+        print("\nDataset Splitting")
+        print("===================")
+
+        self.result_window.insert("end", "\n\nDataset Splitting")
+        self.result_window.insert("end", "\n===================")
+        self.btn_Dataset_splitting.configure(state="disabled")
 
     def training(self):
         self.bool_training = True
 
+        #####################
+        print("Training was done successfully...")
+        CTkMessagebox(title="Success", message="Training was done successfully...", icon="check", option_1="OK")
+        self.process_window.configure(state="normal")
+        self.process_window.insert("end", "\nTraining was done successfully...")
+        self.result_window.configure(state="normal")
+        self.result_window.insert("end", "\nTraining was done successfully...")
+        self.btn_training.configure(state="disabled")
+        self.process_window.configure(state="disabled")
+        self.result_window.configure(state="disabled")
+
     def testing(self):
         self.bool_testing = True
-        if self.bool_training:
-            CTkMessagebox(title="Success", message="Testing was done successfully...", icon="check",
-                          option_1="OK")
-            self.process_window.insert("end", "\n Testing was done successfully...")
-            self.process_window.configure(state="normal")
-            self.result_window.configure(state="normal")
-            self.process_window.insert("end", "\n\nTesting")
-            self.process_window.insert("end", "\n=========")
-            self.result_window.insert("end", "\n\nTesting")
-            self.result_window.insert("end", "\n=========")
+        CTkMessagebox(title="Success", message="Testing was done successfully...", icon="check",
+                      option_1="OK")
+        self.process_window.insert("end", "\n Testing was done successfully...")
+        self.process_window.configure(state="normal")
+        self.result_window.configure(state="normal")
+        self.process_window.insert("end", "\n\nTesting")
+        self.process_window.insert("end", "\n=========")
+        self.result_window.insert("end", "\n\nTesting")
+        self.result_window.insert("end", "\n=========")
+
+        ############
+        print("\n Testing was done successfully...")
+        self.process_window.insert("end", "\n\nTesting was done successfully...")
+        CTkMessagebox(title="Success", message="Testing was done successfully...", icon="check", option_1="OK")
+
+        self.process_window.configure(state="disabled")
+        self.result_window.configure(state="disabled")
+        self.btn_testing.configure(state="disabled")
+
 
     def generate_graph(self):
         self.bool_generate_graphs = True
@@ -634,178 +1157,3 @@ root.mainloop()
 
 
 
-
-
-import os
-import cv2
-import numpy as np
-from scipy.stats import multivariate_normal
-from sklearn.cluster import KMeans
-
-
-class GMM:
-    def __init__(self, n_components=2, max_iter=50, tol=1e-3, reg=1e-6):
-        self.k = n_components
-        self.max_iter = max_iter
-        self.tol = tol
-        self.reg = reg
-
-    def _init(self, X):
-        km = KMeans(
-            n_clusters=self.k,
-            n_init=10,
-            random_state=42
-        ).fit(X)
-
-        self.means = km.cluster_centers_
-
-        d = X.shape[1]
-        self.covars = np.array([np.eye(d) for _ in range(self.k)], dtype=float)
-        self.weights = np.ones(self.k) / self.k
-
-    def fit(self, X):
-
-        X = np.asarray(X, dtype=float)
-
-        n, d = X.shape
-
-        self._init(X)
-
-        prev = -1e18
-
-        for _ in range(self.max_iter):
-
-            resp = np.zeros((n, self.k))
-
-            for c in range(self.k):
-
-                cov = self.covars[c] + np.eye(d) * self.reg
-
-                resp[:, c] = self.weights[c] * multivariate_normal.pdf(
-                    X,
-                    mean=self.means[c],
-                    cov=cov,
-                    allow_singular=True
-                )
-
-            s = resp.sum(axis=1, keepdims=True) + 1e-12
-
-            ll = np.sum(np.log(s))
-
-            resp /= s
-
-            Nk = resp.sum(axis=0) + 1e-12
-
-            self.weights = Nk / n
-
-            self.means = (resp.T @ X) / Nk[:, None]
-
-            for c in range(self.k):
-
-                diff = X - self.means[c]
-
-                self.covars[c] = (
-                    (resp[:, c][:, None] * diff).T @ diff
-                ) / Nk[c]
-
-                self.covars[c] += np.eye(d) * self.reg
-
-            if abs(ll - prev) < self.tol:
-                break
-
-            prev = ll
-
-    def predict(self, X):
-
-        X = np.asarray(X, dtype=float)
-
-        n = X.shape[0]
-
-        g = np.zeros((n, self.k))
-
-        for c in range(self.k):
-
-            g[:, c] = self.weights[c] * multivariate_normal.pdf(
-                X,
-                mean=self.means[c],
-                cov=self.covars[c],
-                allow_singular=True
-            )
-
-        return np.argmax(g, axis=1)
-
-
-def process_image(input_path, output_path):
-
-    img = cv2.imread(input_path)
-
-    if img is None:
-        print("Cannot read :", input_path)
-        return
-
-    img = cv2.resize(img, (512, 512))
-
-    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    pixels = rgb.reshape(-1, 3).astype(float)
-
-    gmm = GMM(n_components=2)
-
-    gmm.fit(pixels)
-
-    labels = gmm.predict(pixels).reshape(img.shape[:2])
-
-    values, counts = np.unique(labels, return_counts=True)
-
-    background = values[np.argmax(counts)]
-
-    mask = np.where(labels == background, 0, 255).astype(np.uint8)
-
-    kernel = np.ones((5, 5), np.uint8)
-
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-    foreground = cv2.bitwise_and(img, img, mask=mask)
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-
-    cv2.imwrite(output_path, foreground)
-
-    print("Saved :", output_path)
-
-
-##############################################################
-# Main
-##############################################################
-
-def main():
-
-    input_folder = "..\\Output\\training\\data_balancing\\Useful_Insects"
-
-    output_folder = "..\\Output\\training\\Background_removal\\Useful_Insects"
-
-    extensions = (".jpg", ".jpeg", ".png", ".bmp", ".tif")
-
-    for root, dirs, files in os.walk(input_folder):
-
-        for file in files:
-
-            if file.lower().endswith(extensions):
-
-                input_path = os.path.join(root, file)
-
-                relative = os.path.relpath(root, input_folder)
-
-                save_folder = os.path.join(output_folder, relative)
-
-                os.makedirs(save_folder, exist_ok=True)
-
-                output_path = os.path.join(save_folder, file)
-
-                process_image(input_path, output_path)
-
-
-if __name__ == "__main__":
-    main()
