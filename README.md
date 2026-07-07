@@ -633,3 +633,179 @@ root.title("AGRICULTURAL INSECT IDENIFICATION")
 root.mainloop()
 
 
+
+
+
+import os
+import cv2
+import numpy as np
+from scipy.stats import multivariate_normal
+from sklearn.cluster import KMeans
+
+
+class GMM:
+    def __init__(self, n_components=2, max_iter=50, tol=1e-3, reg=1e-6):
+        self.k = n_components
+        self.max_iter = max_iter
+        self.tol = tol
+        self.reg = reg
+
+    def _init(self, X):
+        km = KMeans(
+            n_clusters=self.k,
+            n_init=10,
+            random_state=42
+        ).fit(X)
+
+        self.means = km.cluster_centers_
+
+        d = X.shape[1]
+        self.covars = np.array([np.eye(d) for _ in range(self.k)], dtype=float)
+        self.weights = np.ones(self.k) / self.k
+
+    def fit(self, X):
+
+        X = np.asarray(X, dtype=float)
+
+        n, d = X.shape
+
+        self._init(X)
+
+        prev = -1e18
+
+        for _ in range(self.max_iter):
+
+            resp = np.zeros((n, self.k))
+
+            for c in range(self.k):
+
+                cov = self.covars[c] + np.eye(d) * self.reg
+
+                resp[:, c] = self.weights[c] * multivariate_normal.pdf(
+                    X,
+                    mean=self.means[c],
+                    cov=cov,
+                    allow_singular=True
+                )
+
+            s = resp.sum(axis=1, keepdims=True) + 1e-12
+
+            ll = np.sum(np.log(s))
+
+            resp /= s
+
+            Nk = resp.sum(axis=0) + 1e-12
+
+            self.weights = Nk / n
+
+            self.means = (resp.T @ X) / Nk[:, None]
+
+            for c in range(self.k):
+
+                diff = X - self.means[c]
+
+                self.covars[c] = (
+                    (resp[:, c][:, None] * diff).T @ diff
+                ) / Nk[c]
+
+                self.covars[c] += np.eye(d) * self.reg
+
+            if abs(ll - prev) < self.tol:
+                break
+
+            prev = ll
+
+    def predict(self, X):
+
+        X = np.asarray(X, dtype=float)
+
+        n = X.shape[0]
+
+        g = np.zeros((n, self.k))
+
+        for c in range(self.k):
+
+            g[:, c] = self.weights[c] * multivariate_normal.pdf(
+                X,
+                mean=self.means[c],
+                cov=self.covars[c],
+                allow_singular=True
+            )
+
+        return np.argmax(g, axis=1)
+
+
+def process_image(input_path, output_path):
+
+    img = cv2.imread(input_path)
+
+    if img is None:
+        print("Cannot read :", input_path)
+        return
+
+    img = cv2.resize(img, (512, 512))
+
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    pixels = rgb.reshape(-1, 3).astype(float)
+
+    gmm = GMM(n_components=2)
+
+    gmm.fit(pixels)
+
+    labels = gmm.predict(pixels).reshape(img.shape[:2])
+
+    values, counts = np.unique(labels, return_counts=True)
+
+    background = values[np.argmax(counts)]
+
+    mask = np.where(labels == background, 0, 255).astype(np.uint8)
+
+    kernel = np.ones((5, 5), np.uint8)
+
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    foreground = cv2.bitwise_and(img, img, mask=mask)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    cv2.imwrite(output_path, foreground)
+
+    print("Saved :", output_path)
+
+
+##############################################################
+# Main
+##############################################################
+
+def main():
+
+    input_folder = "..\\Output\\training\\data_balancing\\Useful_Insects"
+
+    output_folder = "..\\Output\\training\\Background_removal\\Useful_Insects"
+
+    extensions = (".jpg", ".jpeg", ".png", ".bmp", ".tif")
+
+    for root, dirs, files in os.walk(input_folder):
+
+        for file in files:
+
+            if file.lower().endswith(extensions):
+
+                input_path = os.path.join(root, file)
+
+                relative = os.path.relpath(root, input_folder)
+
+                save_folder = os.path.join(output_folder, relative)
+
+                os.makedirs(save_folder, exist_ok=True)
+
+                output_path = os.path.join(save_folder, file)
+
+                process_image(input_path, output_path)
+
+
+if __name__ == "__main__":
+    main()
